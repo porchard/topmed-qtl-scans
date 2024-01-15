@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+import sys
+import numpy as np
+import pandas as pd
+import pickle
+from deduplicate_susie import deduplicate_susie
+import argparse
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest='subcommand', help='sub-command help')
+
+summarize_parser = subparsers.add_parser('summarize', help='Summarize credible sets.')
+summarize_parser.add_argument('--pickle', required=True, help='Susie pickle file.')
+summarize_parser.add_argument('--single-effect-pips', default=False, action='store_true', help='Output single-effect rather than cross-effect PIPs (default: False)')
+summarize_parser.add_argument('--deduplicate', default=False, action='store_true', help='Deduplicate credible sets (default: False)')
+summarize_parser.add_argument('--prefix', required=True, help='Prefix for new output files. Creates files {prefix}cs.txt and {prefix}converged.txt')
+
+merge_parser = subparsers.add_parser('merge', help='Merge pickle files.')
+merge_parser.add_argument('--pickles', required=True, nargs='+', help='Susie pickle file(s).')
+merge_parser.add_argument('--out', required=True, help='Pickle file to write.')
+
+lbf_parser = subparsers.add_parser('lbf-bed', help='Dump LBF bed file.')
+lbf_parser.add_argument('--pickle', required=True, help='Susie pickle file.')
+
+select_l_parser = subparsers.add_parser('select-l', help='Select L from multiple runs.')
+select_l_parser.add_argument('--pickles', required=True, nargs='+', help='Susie pickle files.')
+select_l_parser.add_argument('--out', required=True, help='Pickle file to write.')
+
+
+args = parser.parse_args()
+
+
+def lbf_to_pip_stabile_vec(vec):
+    w_vec = np.exp(vec - max(vec))
+    return w_vec / sum(w_vec)
+
+
+def lbf_to_pip_stabile(lbf_mat):
+    return [lbf_to_pip_stabile_vec(i) for i in lbf_mat]
+
+
+def get_summary(res_dict, verbose=True, single_effect_pips=False):
+    """
+    res_dict: gene_id -> SuSiE results
+    """
+    summary_df = []
+    for n,k in enumerate(res_dict, 1):
+        if verbose:
+            print(f'\rMaking summary {n}/{len(res_dict)}', end='' if n < len(res_dict) else None)
+        if res_dict[k]['sets']['cs'] is not None and res_dict[k]['converged'] == True:
+            if single_effect_pips:
+                alpha = lbf_to_pip_stabile(res_dict[k]['lbf_variable'])
+            for c in sorted(res_dict[k]['sets']['cs'], key=lambda x: int(x.replace('L',''))):
+                cs = res_dict[k]['sets']['cs'][c]  # indexes
+                if single_effect_pips:
+                    alpha_index = res_dict[k]['sets']['cs_index'].tolist().index(int(c.replace('L', '')) - 1)
+                    p = pd.DataFrame({'snp': res_dict[k]['pip'].index.to_series().iloc[cs].values, 'pip': pd.Series(alpha[alpha_index]).iloc[cs].values, 'af': res_dict[k]['pip'].af.iloc[cs].values})
+                else:
+                    p = res_dict[k]['pip'].iloc[cs].copy().reset_index()
+                p['cs_id'] = c.replace('L','')
+                p.insert(0, 'phenotype_id', k)
+                summary_df.append(p)
+    summary_df = pd.concat(summary_df, axis=0).rename(columns={'snp':'variant_id'}).reset_index(drop=True)
+    return summary_df
+
+
+
+
+if args.subcommand == 'summarize':
+
+    susie = dict()
+    with open(args.pickle, 'rb') as fh:
+        susie.update(pickle.load(fh))
+    
+    cs = get_summary(susie, verbose=False, single_effect_pips=args.single_effect_pips)
+    if args.deduplicate:
+        cs = deduplicate_susie(cs)
+    cs.to_csv(f'{args.prefix}cs.txt', sep='\t', index=False)
+
+    converged = pd.DataFrame([[k, v['converged']] for k, v in susie.items()], columns=['phenotype_id', 'converged'])
+    converged.to_csv(f'{args.prefix}converged.txt', sep='\t', index=False)
+
+elif args.subcommand == 'merge':
+
+    susie = dict()
+    for f in args.pickles:
+        logging.info(f'Loading file {f}')
+        with open(f, 'rb') as fh:
+            tmp = pickle.load(fh)
+            for key, val in tmp.items():
+                assert(key not in susie)
+                susie[key] = val
+
+    with open(args.out, 'wb') as f:
+        pickle.dump(susie, f)
+
+elif args.subcommand == 'lbf-bed':
+
+    susie = dict()
+    with open(args.pickle, 'rb') as fh:
+        susie.update(pickle.load(fh))
+
+    bed = []
+    for gene, v in susie.items():
+        if not v['converged'] or v['sets']['cs'] is None:
+            continue
+        df = pd.DataFrame(v['lbf_variable'], columns=v['pip'].index.to_list())
+        df.index = [f'L{i}' for i in v['sets']['cs_index']]
+        df = df.T
+        EFFECTS = df.columns.to_list()
+        df = df.rename_axis(index='variant_id').reset_index()
+        df[['chrom', 'pos']] = df.variant_id.str.split('_', expand=True).iloc[:,[0,1]]
+        df['end'] = df.pos.astype(int)
+        df['start'] = df.end - 1
+        df['gene'] = gene
+        df = df[['chrom', 'start', 'end', 'variant_id', 'gene'] + EFFECTS]
+        bed.append(df)
+    bed = pd.concat(bed)
+    bed = bed.rename(columns={'chrom': '#chrom'})
+
+    bed.to_csv(sys.stdout, sep='\t', header=True, index=False)
+
+elif args.subcommand == 'select-l':
+
+    def get_number_cs(x, deduplicate=True):
+        """
+        x: SuSiE results
+        """
+        if x['sets']['cs'] is None:
+            return 0
+        else:
+            if deduplicate:
+                sets = set([tuple(v) for v in x['sets']['cs'].values()])
+                return len(sets)
+            else:
+                return len(x['sets']['cs'])
+
+
+    susie = dict()
+    for f in args.pickles:
+        logging.info(f'Loading file {f}')
+        with open(f, 'rb') as fh:
+            tmp = pickle.load(fh)
+            # see if L is noted for each gene.
+            L_given = True
+            for gene in tmp.keys():
+                if 'L' not in tmp[gene]:
+                    L_given = False
+                    break
+            if not L_given:
+                # determine L based on max L observed
+                # do this using all genes in the file, since for a single gene L might be < the set L if the gene is being tested against fewer than L SNPs
+                L = max([v['lbf_variable'].shape[0] for v in tmp.values()])
+                logging.info(f'File seems to represent L = {L}')
+            for gene in tmp.keys():
+                if L_given:
+                    L = tmp[gene]['L']
+                    logging.info(f'Found L = {L} for gene {gene}')
+                if gene not in susie:
+                    susie[gene] = dict()
+                assert(L not in susie[gene])
+                susie[gene][L] = tmp[gene]
+
+    # now for each gene, select ideal L
+    susie_final = dict()
+
+    for gene in susie.keys():
+        Ls = np.array(sorted(susie[gene].keys()))
+        logging.info('Processing gene {} (has Ls {})'.format(gene, ', '.join(Ls.astype(str))))
+        # determine if any converged. If none converged, keep the min L even though this will be ignored in most downstream analyses
+        converged = np.array([susie[gene][L]['converged'] for L in Ls])
+        number_cs = np.array([get_number_cs(susie[gene][L], deduplicate=False) for L in Ls])
+        logging.info('Converged: {}'.format(', '.join(converged.astype(str))))
+        logging.info('Number CS: {}'.format(', '.join(number_cs.astype(str))))
+        if sum(converged) == 0:
+            # If none converged, keep the min L even though this will be ignored in most downstream analyses
+            selected_L = min(Ls)
+            logging.info(f'None converged; keeping min L ({selected_L})')
+            susie_final[gene] = susie[gene][selected_L]
+            susie_final[gene]['L'] = selected_L
+            continue
+        # drop any Ls w/o convergence
+        Ls = Ls[converged]
+        number_cs = number_cs[converged]
+        selected_L = min(Ls[Ls>=max(number_cs)])
+        logging.info(f'Selected L = {selected_L}')
+        susie_final[gene] = susie[gene][selected_L]
+        susie_final[gene]['L'] = selected_L
+
+    # now output the new SuSiE pickled object
+    with open(args.out, 'wb') as f:
+        pickle.dump(susie_final, f)
